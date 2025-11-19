@@ -33,7 +33,6 @@ else
 fi
 
 PYPI_REPO="pypi"
-TEST_PYPI_REPO="testpypi"
 
 # Functions
 print_info() {
@@ -87,9 +86,9 @@ check_pypirc() {
         exit 1
     fi
     
-    # Verify .pypirc has [pypi] or [testpypi] section
-    if ! grep -q "\[pypi\]" "$PYPI_RC" && ! grep -q "\[testpypi\]" "$PYPI_RC"; then
-        print_error ".pypirc found but missing [pypi] or [testpypi] section"
+    # Verify .pypirc has [pypi] section
+    if ! grep -q "\[pypi\]" "$PYPI_RC"; then
+        print_error ".pypirc found but missing [pypi] section"
         print_error "Please add [pypi] section with username and password"
         exit 1
     fi
@@ -116,8 +115,6 @@ check_project_exists() {
     
     if [ "$repo" = "pypi" ]; then
         project_url="https://pypi.org/pypi/${PACKAGE_NAME}/json"
-    elif [ "$repo" = "testpypi" ]; then
-        project_url="https://test.pypi.org/pypi/${PACKAGE_NAME}/json"
     else
         return 1
     fi
@@ -150,17 +147,124 @@ create_project_info() {
         print_info "✅ As a new project, you have full ownership"
         return 0
     else
-        print_warn "⚠️  Project '${PACKAGE_NAME}' already exists on ${repo}"
-        print_warn "   URL: https://${repo}.org/project/${PACKAGE_NAME}/"
-        
-        if [ "$repo" = "pypi" ]; then
-            print_error "   This project may be owned by another user"
-            print_error "   If you get 403 Forbidden, you need to:"
-            print_error "   1. Change package name in pyproject.toml"
-            print_error "   2. Or request access from current owner"
-        fi
+        print_info "ℹ️  Project '${PACKAGE_NAME}' already exists on ${repo}"
+        print_info "   URL: https://${repo}.org/project/${PACKAGE_NAME}/"
+        print_info "   (This is normal if you are the project owner)"
         return 1
     fi
+}
+
+increment_version() {
+    print_info "Checking current version..."
+    
+    # Read current version from pyproject.toml
+    if [ ! -f "pyproject.toml" ]; then
+        print_error "pyproject.toml not found!"
+        return 1
+    fi
+    
+    current_version=$(python3 -c "
+import re
+try:
+    with open('pyproject.toml', 'r') as f:
+        content = f.read()
+        match = re.search(r'^version\s*=\s*\"([^\"]+)\"', content, re.MULTILINE)
+        if match:
+            print(match.group(1))
+        else:
+            print('0.1.0')
+except Exception:
+    print('0.1.0')
+" 2>/dev/null || echo "0.1.0")
+    
+    if [ -z "$current_version" ]; then
+        current_version="0.1.0"
+    fi
+    
+    print_info "Current version: $current_version"
+    
+    # Parse version components (major.minor.patch)
+    IFS='.' read -ra version_parts <<< "$current_version"
+    major="${version_parts[0]:-0}"
+    minor="${version_parts[1]:-1}"
+    patch="${version_parts[2]:-0}"
+    
+    # Calculate new versions
+    new_patch=$((patch + 1))
+    new_minor=$((minor + 1))
+    new_major=$((major + 1))
+    
+    patch_version="${major}.${minor}.${new_patch}"
+    minor_version="${major}.${new_minor}.0"
+    major_version="${new_major}.0.0"
+    
+    # Interactive prompts: Default is patch
+    print_info ""
+    print_info "Version increment options:"
+    print_info "  1. Patch: $current_version → $patch_version (default)"
+    print_info "  2. Minor: $current_version → $minor_version"
+    print_info "  3. Major: $current_version → $major_version"
+    print_info ""
+    
+    # First prompt: Patch (default Y)
+    read -p "Increment patch version to $patch_version? (Y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+        # Second prompt: Minor
+        print_info ""
+        read -p "Increment minor version to $minor_version? (Y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Nn]$ ]]; then
+            # Third prompt: Major
+            print_info ""
+            read -p "Increment major version to $major_version? (Y/n): " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Nn]$ ]]; then
+                print_error "Version increment cancelled by user"
+                return 1
+            else
+                new_version="$major_version"
+                print_info "✅ Incrementing major version to $new_version"
+            fi
+        else
+            new_version="$minor_version"
+            print_info "✅ Incrementing minor version to $new_version"
+        fi
+    else
+        new_version="$patch_version"
+        print_info "✅ Incrementing patch version to $new_version"
+    fi
+    
+    # Update pyproject.toml
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS
+        sed -i '' "s/version = \"$current_version\"/version = \"$new_version\"/g" pyproject.toml
+    else
+        # Linux
+        sed -i "s/version = \"$current_version\"/version = \"$new_version\"/g" pyproject.toml
+    fi
+    
+    # Update ngenctl/__init__.py
+    if [ -f "ngenctl/__init__.py" ]; then
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # macOS
+            sed -i '' "s/__version__ = \"$current_version\"/__version__ = \"$new_version\"/g" ngenctl/__init__.py
+        else
+            # Linux
+            sed -i "s/__version__ = \"$current_version\"/__version__ = \"$new_version\"/g" ngenctl/__init__.py
+        fi
+    fi
+    
+    print_info "Version updated to $new_version"
+    
+    # Optional: commit the version change if in git repo
+    if git rev-parse --git-dir > /dev/null 2>&1; then
+        git add pyproject.toml ngenctl/__init__.py 2>/dev/null || true
+        git commit -m "Bump version to $new_version" --no-verify 2>/dev/null || true
+        print_info "Version change committed"
+    fi
+    
+    return 0
 }
 
 clean_build() {
@@ -367,62 +471,16 @@ except Exception as e:
     fi
 }
 
-publish_test() {
-    print_info "Publishing to Test PyPI..."
-    
-    # Check if project exists
-    create_project_info "testpypi"
-    is_new_project=$?
-    
-    if [ $is_new_project -eq 0 ]; then
-        print_info "✅ This is a new project - will be created automatically on first upload"
-    fi
-    
-    print_info "Using credentials from ~/.pypirc"
-    print_info "Package: ${PACKAGE_NAME}"
-    
-    read -p "Do you want to continue? (y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        print_warn "Publishing to Test PyPI cancelled"
-        return
-    fi
-    
-    # Upload using twine (automatically reads from ~/.pypirc)
-    print_info "Uploading to Test PyPI..."
-    python3 -m twine upload --repository ${TEST_PYPI_REPO} dist/*
-    
-    upload_status=$?
-    
-    if [ $upload_status -eq 0 ]; then
-        print_info "✅ Published to Test PyPI successfully!"
-        if [ $is_new_project -eq 0 ]; then
-            print_info "✅ Project '${PACKAGE_NAME}' has been created on Test PyPI"
-        fi
-        print_info "Test installation: pip install -i https://test.pypi.org/simple/ ${PACKAGE_NAME}"
-        print_info "Project URL: https://test.pypi.org/project/${PACKAGE_NAME}/"
-    else
-        print_error "❌ Publishing to Test PyPI failed!"
-        print_error "Check your credentials in ~/.pypirc"
-        print_error "Verify API token is valid and has correct permissions"
-        exit 1
-    fi
-}
-
 publish_prod() {
     print_info "Publishing to PyPI (production)..."
-    print_warn "⚠️  This will publish to the public PyPI repository!"
-    print_warn "⚠️  Make sure you have tested the package first."
     
-    # Check if project exists
+    # Check if project exists (informational only)
     create_project_info "pypi"
     is_new_project=$?
     
     if [ $is_new_project -eq 0 ]; then
         print_info "✅ This is a new project - will be created automatically on first upload"
         print_info "✅ As project owner, you'll have full control"
-    else
-        print_warn "⚠️  Project already exists - you may need permission to upload"
     fi
     
     print_info "Using credentials from ~/.pypirc"
@@ -438,8 +496,8 @@ publish_prod() {
     
     # Upload using twine (automatically reads from ~/.pypirc)
     print_info "Uploading to PyPI..."
-    python3 -m twine upload --repository ${PYPI_REPO} dist/*
     
+    python3 -m twine upload --repository pypi dist/*
     upload_status=$?
     
     if [ $upload_status -eq 0 ]; then
@@ -497,6 +555,14 @@ main() {
     check_requirements
     check_pypirc
     check_package
+    
+    # Increment version before building
+    increment_version
+    if [ $? -ne 0 ]; then
+        print_warn "Build cancelled due to version increment failure"
+        exit 1
+    fi
+    
     clean_build
     build_package
     check_dist
@@ -509,42 +575,36 @@ main() {
     echo
     echo "Next steps:"
     echo "1. Test locally: pip install dist/${PACKAGE_NAME}-*.whl"
-    echo "2. Publish to Test PyPI: ./publish.sh --test"
-    echo "3. Publish to PyPI: ./publish.sh --publish"
+    echo "2. Publish to PyPI: ./build.sh --release"
     echo
 }
 
 # Handle command line arguments
 case "${1:-}" in
-    --test)
+    --release)
     check_requirements
     check_pypirc
     check_package
     if [ ! -d "dist" ]; then
-        print_warn "No dist directory found. Building package first..."
-        clean_build
-        build_package
-        check_dist
+        print_warn "No dist directory found. You need to build first."
+        print_warn "Run './build.sh' to build with version increment, then './build.sh --release' to publish"
+        exit 1
     fi
     test_package || exit 1
-    publish_test
-        ;;
-    --publish)
-    check_requirements
-    check_pypirc
-    check_package
-    if [ ! -d "dist" ]; then
-        print_warn "No dist directory found. Building package first..."
-        clean_build
-        build_package
-        check_dist
-    fi
-    test_package || exit 1
-    publish_prod
+    python3 -m twine upload --repository pypi dist/*
+    # publish_prod
         ;;
     --build-only)
         check_requirements
         check_package
+        
+        # Increment version before building
+        increment_version
+        if [ $? -ne 0 ]; then
+            print_warn "Build cancelled due to version increment failure"
+            exit 1
+        fi
+        
         clean_build
         build_package
         check_dist
@@ -555,8 +615,7 @@ case "${1:-}" in
         echo
         echo "Options:"
         echo "  (no option)    Build package and check distribution"
-        echo "  --test         Build and publish to Test PyPI"
-        echo "  --publish      Build and publish to PyPI (production)"
+        echo "  --release      Build and publish to PyPI (production)"
         echo "  --build-only   Only build package, don't publish"
         echo "  --help, -h     Show this help message"
         echo
